@@ -60,12 +60,13 @@ Limpiar pizarra: Sostener la pose OK con ambas manos simultáneamente durante ~0
 
 Teclas de atajo
 C: Iniciar/Repetir el proceso de calibración de 4 puntos.
-M: Menu que incluye todo lo de arriba e integra el cambio de cámara si es que el dispositivo tiene mas de una.
+
 P: Paleta de colores y sliders de resize interactivos para el puntero.
+
 +/-: Atajo al resize directamente en el teclado.
 
 F: Alternar entre pantalla completa y modo ventana.
 
-D: Mostrar/Ocultar la ventana de cámara (solo en modo --debug).
-
 ESC: Salir de la aplicación.
+
+M: Menu que incluye todo lo de arriba e integra el cambio de cámara si es que el dispositivo tiene mas de una.
