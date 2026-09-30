@@ -14,23 +14,27 @@ Ejecucion:
 Teclas (siempre disponibles, son de desarrollo):
     ESC   salir
     C     recalibrar
+    M     menu popup (camara, paleta, recalibrar, fullscreen, limpiar)
+    P     popup de paleta: rueda de color + brillo + tamano (mouse o pinch)
+    + / - tamano del brush y del borrador (tambien dentro de la paleta)
     F     alternar fullscreen
     D     alternar vista de camara (solo con --debug)
 """
 
 import argparse
 import sys
+import threading
 import time
 
 import cv2
 import numpy as np
 import pygame
 
-from chalk import (BOARD_W, BOARD_H, ERASE_RADIUS, FG, ChalkRenderer,
-                   calibration_targets)
+from chalk import BOARD_W, BOARD_H, ChalkRenderer, calibration_targets
 from gestures import GestureDetector, GestureState
+from palette import Palette
 from track import (Tracker, apply_homography, compute_homography, draw_debug,
-                   load_config, save_config)
+                   list_cameras, load_config, save_config)
 
 # --- Umbrales de pinch (con histeresis) --------------------------------------
 # pinch = distancia pulgar-indice / tamano de mano. Ajustar segun tus pruebas.
@@ -44,6 +48,18 @@ EXT_RATIO = 1.15                      # dedo extendido: dist(punta, muneca) > 1.
 CLEAR_HOLD = 0.7                      # segundos con AMBAS manos en OK para limpiar
 
 BOARD_SIZE = (BOARD_W, BOARD_H)
+
+# --- Menu principal (tecla M) --------------------------------------------------
+MENU_ITEMS = [
+    ("cameras", "Cambiar camara"),
+    ("palette", "Paleta de colores  (P)"),
+    ("calib", "Recalibrar  (C)"),
+    ("full", "Pantalla completa  (F)"),
+    ("clear", "Limpiar pizarra"),
+    ("close", "Cerrar"),
+]
+RESUME_DELAY = 0.4                    # s sin dibujar tras cerrar un popup con pinch
+TOAST_TIME = 1.2
 
 
 def make_detector(enable_erase=True):
@@ -94,6 +110,20 @@ class App:
         self.clear_progress = 0.0     # 0..1, feedback visual de limpiar
         self.running = True
 
+        # popups: None | "menu" (tecla M) | "camera" (desde el menu) | "palette" (tecla P)
+        self.palette = Palette(BOARD_W, BOARD_H)
+        self.popup = None
+        self.sel = {"menu": 0, "camera": 0}
+        self.menu_cams = []           # [{"index", "label"}]
+        self.menu_status = ""
+        self.ptr_gestures = make_detector(enable_erase=False)   # pinch = clic en popups
+        self.pointer = None           # puntero de la mano en coords Board (solo popups)
+        self._ptr_last = None
+        self._resume_at = 0.0         # hasta cuando no se dibuja tras cerrar un popup
+        self._toast = ("", 0.0)
+        self._scan_thread = None
+        self._scan_result = None      # lo escribe el hilo de busqueda, lo lee el bucle
+
     # -- calibracion -------------------------------------------------------------
     def start_calibration(self):
         self.state = self.STATE_CALIB
@@ -130,6 +160,183 @@ class App:
         self.hand_ctx = {}
         self.cursors = []
 
+    # -- popups --------------------------------------------------------------------
+    def _reset_hands(self):
+        """Estado de gestos limpio (quedaba congelado mientras habia un popup)."""
+        self.hand_ctx = {}
+        self.cursors = []
+        self.gestures = make_detector(enable_erase=False)
+        self.ptr_gestures = make_detector(enable_erase=False)
+        self.pointer = None
+        self._ptr_last = None
+        self._clear_since = None
+        self._clear_done = False
+        self.clear_progress = 0.0
+
+    def open_popup(self, name):
+        if self.popup is None:
+            self._reset_hands()       # entre popups NO se resetea: el pinch en curso sigue
+        self.popup = name
+        if name in self.sel:
+            self.sel[name] = 0
+        if name == "camera":
+            self.menu_cams = []
+            self._start_scan()
+
+    def close_popup(self):
+        self.popup = None
+        self.menu_status = ""
+        self._reset_hands()
+        self._resume_at = time.perf_counter() + RESUME_DELAY
+
+    def toggle_popup(self, name):
+        if self.popup == name:
+            self.close_popup()
+        else:
+            self.open_popup(name)
+
+    def _change_size(self, delta):
+        self.palette.change_size(delta)
+        p = self.palette
+        self._toast = (f"Tamano {p.size} px | borrador {p.erase_radius} px",
+                       time.perf_counter() + TOAST_TIME)
+
+    def _activate(self, page, i):
+        if page == "menu":
+            self._activate_menu(i)
+        else:
+            self._apply_camera(i)
+
+    def _activate_menu(self, i):
+        action = MENU_ITEMS[i][0]
+        if action == "cameras":
+            self.open_popup("camera")
+        elif action == "palette":
+            self.open_popup("palette")
+        elif action == "calib":
+            self.close_popup()
+            self.start_calibration()
+        elif action == "full":
+            self.chalk.toggle_fullscreen()
+        elif action == "clear":
+            self.chalk.clear_board()
+            self.close_popup()
+        else:
+            self.close_popup()
+
+    def _start_scan(self):
+        """Busca camaras en un hilo aparte para no congelar la ventana."""
+        self.menu_status = "Buscando camaras..."
+        if self._scan_thread is not None and self._scan_thread.is_alive():
+            return
+        self._scan_result = None
+        in_use = self.tracker.camera_index
+
+        def work():
+            self._scan_result = list_cameras(in_use=in_use)
+
+        self._scan_thread = threading.Thread(target=work, daemon=True)
+        self._scan_thread.start()
+
+    def _poll_scan(self):
+        if self._scan_result is None:
+            return
+        self.menu_cams, self._scan_result = self._scan_result, None
+        cur = self._current_cam_pos()
+        self.sel["camera"] = max(cur, 0)
+        self.menu_status = "" if self.menu_cams else "No se encontraron camaras"
+
+    def _current_cam_pos(self):
+        for i, c in enumerate(self.menu_cams):
+            if c["index"] == self.tracker.camera_index:
+                return i
+        return -1
+
+    def _apply_camera(self, pos):
+        if not (0 <= pos < len(self.menu_cams)):
+            return
+        cam = self.menu_cams[pos]
+        if cam["index"] == self.tracker.camera_index:
+            self.open_popup("menu")
+            return
+        # switch_camera bloquea ~1 s: se pinta antes el aviso
+        self.menu_status = f"Cambiando a camara {cam['index']}..."
+        self._render(None)
+        try:
+            switched = self.tracker.switch_camera(cam["index"])
+        except RuntimeError as e:
+            self.menu_status = f"Error: {e}"
+            return
+        if not switched:
+            self.menu_status = f"No se pudo abrir la camara {cam['index']}"
+            return
+        print(f"[main] Camara activa: {cam['index']}")
+        self.close_popup()
+        # la homografia guardada es de la camara anterior: hay que recalibrar
+        self.start_calibration()
+
+    def _handle_list_key(self, e):
+        page = self.popup
+        n = len(MENU_ITEMS) if page == "menu" else len(self.menu_cams)
+        k = e.key
+        if k == pygame.K_ESCAPE:
+            if page == "camera":
+                self.popup = "menu"           # volver al menu principal
+            else:
+                self.close_popup()
+        elif k in (pygame.K_UP, pygame.K_w) and n:
+            self.sel[page] = (self.sel[page] - 1) % n
+        elif k in (pygame.K_DOWN, pygame.K_s) and n:
+            self.sel[page] = (self.sel[page] + 1) % n
+        elif k in (pygame.K_RETURN, pygame.K_KP_ENTER) and n:
+            self._activate(page, self.sel[page])
+        elif k == pygame.K_r and page == "camera":
+            self.menu_cams = []
+            self._start_scan()
+
+    def _pointer(self, kind, pos):
+        """Puntero unificado (mouse o mano): kind = "down" | "move" | "up"."""
+        if self.popup == "palette":
+            if self.palette.pointer(kind, pos):
+                self.close_popup()
+            return
+        hit = self.chalk.menu_hit(pos)
+        if hit is None:
+            return
+        self.sel[self.popup] = hit
+        if kind == "down":
+            self._activate(self.popup, hit)
+
+    def _handle_mouse(self, e):
+        if e.type == pygame.MOUSEMOTION:
+            self._pointer("move", e.pos)
+        elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+            self._pointer("down", e.pos)
+        elif e.type == pygame.MOUSEBUTTONUP and e.button == 1:
+            self._pointer("up", e.pos)
+
+    def _update_popup(self, hands):
+        """Con un popup abierto, el indice de la mano es el puntero y el pinch es el clic."""
+        self.pointer = None
+        if self.state != self.STATE_RUN or self.H is None:
+            return
+        hand = hands[0] if hands else None
+        st = self.ptr_gestures.update(hand)
+        if hand is not None:
+            pos = apply_homography(self.H, hand.index_tip)
+            self._ptr_last = pos
+            self.pointer = pos
+        else:
+            pos = self._ptr_last
+        if pos is None:
+            return
+        if st == GestureState.PINCH_DOWN:
+            self._pointer("down", pos)
+        elif st == GestureState.PINCH_UP:
+            self._pointer("up", pos)
+        elif hand is not None:
+            self._pointer("move", pos)
+
     # -- bucle principal -----------------------------------------------------------
     def run(self):
         print("[main] Iniciando camara y tracker...")
@@ -140,7 +347,10 @@ class App:
                 hands = self.tracker.get_hands()
                 hand = hands[0] if hands else None    # calibracion y HUD
 
-                if self.state == self.STATE_CALIB:
+                if self.popup:
+                    self._poll_scan()          # con un popup abierto no se dibuja ni calibra
+                    self._update_popup(hands)
+                elif self.state == self.STATE_CALIB:
                     self._update_calibration(hand)
                 else:
                     self._update_run(hands)
@@ -156,6 +366,9 @@ class App:
 
     def _update_run(self, hands):
         """Dibujar (pinch), borrar (OK) y limpiar (dos manos en OK), por mano."""
+        if time.perf_counter() < self._resume_at:   # acaba de cerrarse un popup
+            self.cursors = []
+            return
         seen = set()
         for h in hands:
             ctx = self.hand_ctx.setdefault(h.handedness, HandCtx())
@@ -199,11 +412,11 @@ class App:
                 ctx.last_pos = pos
             elif state == GestureState.PINCH_DRAG:
                 if ctx.last_pos is not None:
-                    self.chalk.stroke(ctx.last_pos, pos, FG)
+                    self.chalk.stroke(ctx.last_pos, pos, self.palette.color, self.palette.size)
                 ctx.last_pos = pos
             elif state == GestureState.ERASE and not both_ok:
                 pts = [ctx.last_pos, pos] if ctx.last_pos is not None else [pos]
-                self.chalk.erase(pts, ERASE_RADIUS)
+                self.chalk.erase(pts, self.palette.erase_radius)
                 ctx.last_pos = pos
             else:
                 ctx.last_pos = None
@@ -213,16 +426,39 @@ class App:
             if e.type == pygame.QUIT:
                 self.running = False
             elif e.type == pygame.KEYDOWN:
-                if e.key == pygame.K_ESCAPE:
-                    self.running = False
-                elif e.key == pygame.K_c:
-                    self.start_calibration()
-                elif e.key == pygame.K_f:
-                    self.chalk.toggle_fullscreen()
-                elif e.key == pygame.K_d and self.debug:
-                    self.show_cam = not self.show_cam
-                    if not self.show_cam:
-                        cv2.destroyWindow("VirtualChalk - camara (debug)")
+                self._handle_key(e)
+            elif self.popup and e.type in (pygame.MOUSEMOTION, pygame.MOUSEBUTTONDOWN,
+                                           pygame.MOUSEBUTTONUP):
+                self._handle_mouse(e)
+
+    def _handle_key(self, e):
+        k = e.key
+        if e.unicode == "+" or k in (pygame.K_PLUS, pygame.K_KP_PLUS, pygame.K_EQUALS):
+            self._change_size(+1)
+        elif e.unicode == "-" or k in (pygame.K_MINUS, pygame.K_KP_MINUS):
+            self._change_size(-1)
+        elif k == pygame.K_p:
+            self.toggle_popup("palette")
+        elif k == pygame.K_m:
+            if self.popup is None:
+                self.open_popup("menu")
+            else:
+                self.close_popup()
+        elif self.popup in ("menu", "camera"):
+            self._handle_list_key(e)
+        elif self.popup == "palette":
+            if k == pygame.K_ESCAPE:
+                self.close_popup()
+        elif k == pygame.K_ESCAPE:
+            self.running = False
+        elif k == pygame.K_c:
+            self.start_calibration()
+        elif k == pygame.K_f:
+            self.chalk.toggle_fullscreen()
+        elif k == pygame.K_d and self.debug:
+            self.show_cam = not self.show_cam
+            if not self.show_cam:
+                cv2.destroyWindow("VirtualChalk - camara (debug)")
 
     # -- render ---------------------------------------------------------------------
     def _render(self, hand):
@@ -239,7 +475,27 @@ class App:
             clear_progress=self.clear_progress,
             pinch_value=hand.pinch if (calibrating and hand is not None) else None,
             pinching=pinching,
+            menu=self._menu_view(),
+            palette=self.palette if self.popup == "palette" else None,
+            pointer=self.pointer if self.popup else None,
+            brush={"color": self.palette.color, "size": self.palette.size,
+                   "erase_radius": self.palette.erase_radius},
+            toast=self._toast[0] if time.perf_counter() < self._toast[1] else None,
         )
+
+    def _menu_view(self):
+        if self.popup == "menu":
+            return {"title": "Menu", "items": [label for _, label in MENU_ITEMS],
+                    "selected": self.sel["menu"], "current": -1, "status": "",
+                    "hint": "flechas: elegir  Enter/clic/pinch: aplicar  M/ESC: cerrar"}
+        if self.popup == "camera":
+            return {"title": "Cambiar camara",
+                    "items": [c["label"] for c in self.menu_cams],
+                    "selected": self.sel["camera"], "current": self._current_cam_pos(),
+                    "status": self.menu_status,
+                    "hint": "flechas: elegir  Enter/clic: aplicar  R: reescanear  "
+                            "ESC: volver  M: cerrar"}
+        return None
 
     # -- vista de camara (solo debug) -----------------------------------------------------
     def _show_camera(self, hands):

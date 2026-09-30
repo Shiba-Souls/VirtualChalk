@@ -20,6 +20,7 @@ Coordenadas: todas normalizadas 0.0 -> 1.0 sobre la imagen ESPEJADA.
 
 import json
 import math
+import sys
 import threading
 import time
 import urllib.request
@@ -170,6 +171,53 @@ class Tracker:
         if self._cap is not None:
             self._cap.release()
             self._cap = None
+
+    def switch_camera(self, index):
+        """
+        Cambia a otra camara sin reiniciar MediaPipe.
+        Devuelve True si cambio; False si no pudo abrir `index` (y se queda con la
+        anterior). Lanza RuntimeError solo si tampoco puede reabrir la anterior.
+        Bloquea ~1 s (abrir la camara): llamar desde el hilo principal esta bien.
+        """
+        if index == self.camera_index and self._cap is not None:
+            return True
+
+        # 1) parar el hilo de captura y soltar la camara actual
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+        if self._cap is not None:
+            self._cap.release()
+            self._cap = None
+
+        # 2) abrir la nueva; si falla, volver a la anterior
+        old = self.camera_index
+        switched = True
+        try:
+            self.camera_index = index
+            self._open_camera()
+        except RuntimeError as e:
+            print(f"[track] {e}")
+            switched = False
+            self.camera_index = old
+            self._open_camera()            # si esto falla, RuntimeError sube
+
+        # 3) limpiar estado de la camara anterior y reanudar
+        with self._lock:
+            self._hands = []
+            self._frame = None
+        self._capture_times.clear()
+        for fx, fy in self._filters.values():
+            fx.reset()
+            fy.reset()
+        self.fps = 0.0
+        self.latency_ms = 0.0
+
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return switched
 
     # -- lectura desde otros hilos -------------------------------------------
     def get_hands(self):
@@ -334,6 +382,38 @@ class Tracker:
 
 
 # ---------------------------------------------------------------------------
+# Deteccion de camaras disponibles (para el menu de cambio de camara)
+# ---------------------------------------------------------------------------
+def list_cameras(max_index=6, in_use=None):
+    """
+    Camaras disponibles como [{"index": i, "label": str}].
+    OpenCV no da nombres, asi que se prueba abrir cada indice. La camara `in_use`
+    (la del Tracker) no se prueba: ya esta abierta y una segunda apertura fallaria.
+    Es lento (cientos de ms por indice): correrlo en un hilo aparte.
+    """
+    backend = cv2.CAP_DSHOW if sys.platform.startswith("win") else cv2.CAP_ANY
+    found = []
+    for i in range(max_index):
+        if i == in_use:
+            found.append({"index": i, "label": f"Camara {i}"})
+            continue
+        cap = cv2.VideoCapture(i, backend)
+        try:
+            if cap.isOpened():
+                ok, _ = cap.read()
+                if ok:
+                    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    found.append({"index": i, "label": f"Camara {i}  ({w}x{h})"})
+        finally:
+            cap.release()
+    if in_use is not None and all(c["index"] != in_use for c in found):
+        found.append({"index": in_use, "label": f"Camara {in_use}"})
+        found.sort(key=lambda c: c["index"])
+    return found
+
+
+# ---------------------------------------------------------------------------
 # Calibracion: camara (normalizada) -> Board (pixeles) mediante homografia
 # ---------------------------------------------------------------------------
 CONFIG_PATH = Path(__file__).parent / "config.json"
@@ -412,4 +492,4 @@ def draw_debug(frame, hands):
         cv2.putText(frame, f"{hand.handedness}  pinch={hand.pinch:.2f}",
                     (10, 30 + 30 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                     (255, 255, 255), 2)
-    return frame
+    return frame

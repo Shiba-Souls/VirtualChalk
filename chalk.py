@@ -14,6 +14,8 @@ import time
 
 import pygame
 
+from palette import DEFAULT_SIZE, ERASE_PER_SIZE  # noqa: F401
+
 # --- Parametros del Board ---------------------------------------------------
 BOARD_W, BOARD_H = 1280, 720          # resolucion interna del render
 MARGIN = 90                           # distancia de los marcadores a las esquinas
@@ -59,6 +61,10 @@ class Board:
         if len(points) < 2:
             return
         pygame.draw.lines(self.surface, color, False, points, width)
+        if width > 3:                       # puntas redondas: sin huecos entre segmentos
+            r = width // 2
+            for p in (points[0], points[-1]):
+                pygame.draw.circle(self.surface, color, (int(p[0]), int(p[1])), r)
 
     def erase(self, points, radius=ERASE_RADIUS):
         """Borra con un pincel circular del color de fondo a lo largo de `points`."""
@@ -120,6 +126,7 @@ class ChalkRenderer:
         self.font_big = pygame.font.SysFont("segoeui", 40, bold=True)
         self.font_small = pygame.font.SysFont("consolas", 18)
         self.clock = pygame.time.Clock()
+        self.menu_rects = []          # rects de las filas del menu de camara (para el mouse)
 
     # -- ventana ---------------------------------------------------------------
     def _set_display(self):
@@ -150,12 +157,19 @@ class ChalkRenderer:
     def quit():
         pygame.quit()
 
+    def menu_hit(self, pos):
+        """Indice de la fila del menu de camara bajo `pos` (coords Board) o None."""
+        for i, rect in enumerate(self.menu_rects):
+            if rect.collidepoint(pos):
+                return i
+        return None
+
     # -- operaciones sobre la pizarra ---------------------------------------------
     def clear_board(self):
         self.board.clear()
 
-    def stroke(self, p0, p1, color=FG):
-        self.board.draw_stroke(color, [p0, p1])
+    def stroke(self, p0, p1, color=FG, width=STROKE_WIDTH):
+        self.board.draw_stroke(color, [p0, p1], width)
 
     def erase(self, points, radius=ERASE_RADIUS):
         self.board.erase(points, radius)
@@ -163,7 +177,8 @@ class ChalkRenderer:
     # -- render principal --------------------------------------------------------------
     def render(self, mode, hand_present, stats,
                calib=None, cursors=None, clear_progress=0.0,
-               pinch_value=None, pinching=False):
+               pinch_value=None, pinching=False, menu=None,
+               palette=None, pointer=None, brush=None, toast=None):
         """
         mode            "calibrating" | "running"
         hand_present    bool, para el indicador de mano
@@ -173,6 +188,12 @@ class ChalkRenderer:
         clear_progress  0..1 de limpiar la pizarra
         pinch_value     valor de pinch a mostrar en calibracion (o None)
         pinching        True si el pinch esta activo (color del texto en calibracion)
+        menu            dict {title, items, selected, current, status, hint} o None
+                        (popup de lista: menu principal o camaras)
+        palette         objeto Palette a dibujar como popup, o None
+        pointer         posicion del puntero de la mano en coords Board (popups) o None
+        brush           dict {color, size, erase_radius} del pincel actual
+        toast           texto breve inferior (p. ej. cambio de tamano) o None
         """
         c = self.canvas
         c.fill(BG)
@@ -181,9 +202,24 @@ class ChalkRenderer:
         if mode == "calibrating":
             self._render_calibration(c, calib or {}, pinch_value, pinching)
         else:
-            self._render_run(c, cursors or [], clear_progress)
+            self._render_run(c, cursors or [], clear_progress,
+                             brush or {"color": FG, "size": DEFAULT_SIZE,
+                                       "erase_radius": ERASE_RADIUS})
 
         self._render_status(c, hand_present, stats)
+        self.menu_rects = []
+        if menu is not None:
+            self._render_menu(c, menu)
+        elif palette is not None:
+            self._veil(c)
+            palette.draw(c, self.font, self.font_big, self.font_small)
+        if toast:
+            draw_text(c, self.font, toast, (BOARD_W // 2, BOARD_H - 70), ACCENT, center=True)
+        if pointer is not None:
+            x = int(min(max(pointer[0], 0), BOARD_W - 1))
+            y = int(min(max(pointer[1], 0), BOARD_H - 1))
+            pygame.draw.circle(c, ACCENT, (x, y), 14, 2)
+            pygame.draw.circle(c, ACCENT, (x, y), 3)
         self.screen.blit(c, (0, 0))
         pygame.display.flip()
 
@@ -211,7 +247,7 @@ class ChalkRenderer:
             draw_text(c, self.font_small, f"pinch={pinch_value:.2f}",
                       (BOARD_W // 2, 300), OK if pinching else FG, center=True)
 
-    def _render_run(self, c, cursors, clear_progress):
+    def _render_run(self, c, cursors, clear_progress, brush):
         # marco del area calibrada
         pygame.draw.rect(c, FRAME, (0, 0, BOARD_W, BOARD_H), 2)
         for p in calibration_targets():
@@ -220,7 +256,7 @@ class ChalkRenderer:
         draw_text(c, self.font, "VirtualChalk", (24, 20), FG)
         draw_text(c, self.font_small,
                   "pinch: dibujar   OK: borrar   2 manos OK: limpiar   "
-                  "C recalibrar   F fullscreen   ESC salir",
+                  "M menu   P paleta   +/- tamano   C recalibrar   F fullscreen   ESC salir",
                   (24, 58), DIM)
 
         for pos, state in cursors:
@@ -229,14 +265,20 @@ class ChalkRenderer:
             cy = min(max(pos[1], 0), BOARD_H - 1)
             if state == "erase":
                 # circulo con el tamano real del borrador
-                pygame.draw.circle(c, WARN, (int(cx), int(cy)), ERASE_RADIUS, 2)
+                pygame.draw.circle(c, WARN, (int(cx), int(cy)), brush["erase_radius"], 2)
                 continue
             inside = (0 <= pos[0] < BOARD_W) and (0 <= pos[1] < BOARD_H)
             col = ACCENT if inside else WARN
             pygame.draw.circle(c, col, (int(cx), int(cy)), 16, 3)
-            pygame.draw.circle(c, col, (int(cx), int(cy)), 4)
+            pygame.draw.circle(c, brush["color"] if inside else col,
+                               (int(cx), int(cy)), max(brush["size"] // 2, 4))
             if state == "draw":
                 pygame.draw.circle(c, OK, (int(cx), int(cy)), 26, 3)
+
+        # muestra del pincel actual (esquina inferior derecha)
+        bx0, by0 = BOARD_W - 50, BOARD_H - 50
+        pygame.draw.circle(c, DIM, (bx0, by0), 22, 1)
+        pygame.draw.circle(c, brush["color"], (bx0, by0), min(brush["size"] // 2 + 1, 20))
 
         # progreso de "limpiar pizarra" (dos manos en OK sostenido)
         if clear_progress > 0:
@@ -248,6 +290,45 @@ class ChalkRenderer:
             pygame.draw.rect(c, FRAME, (bx, 140, bw, 10), border_radius=5)
             pygame.draw.rect(c, WARN, (bx, 140, int(bw * clear_progress), 10),
                              border_radius=5)
+
+    def _veil(self, c):
+        veil = pygame.Surface((BOARD_W, BOARD_H), pygame.SRCALPHA)
+        veil.fill((0, 0, 0, 170))
+        c.blit(veil, (0, 0))
+
+    def _render_menu(self, c, menu):
+        """Popup modal de lista (menu principal / camaras), encima de todo."""
+        self._veil(c)
+
+        items = menu.get("items", [])
+        row_h, pw = 52, 760
+        ph = 120 + max(len(items), 1) * row_h + 60
+        px, py = (BOARD_W - pw) // 2, (BOARD_H - ph) // 2
+        pygame.draw.rect(c, BG, (px, py, pw, ph), border_radius=14)
+        pygame.draw.rect(c, ACCENT, (px, py, pw, ph), 2, border_radius=14)
+
+        draw_text(c, self.font_big, menu.get("title", ""), (BOARD_W // 2, py + 42), FG, center=True)
+        if menu.get("status"):
+            draw_text(c, self.font_small, menu["status"],
+                      (BOARD_W // 2, py + 88), WARN, center=True)
+
+        self.menu_rects = []
+        y = py + 120
+        for i, label in enumerate(items):
+            rect = pygame.Rect(px + 24, y, pw - 48, row_h - 8)
+            pygame.draw.rect(c, FRAME, rect, border_radius=8)
+            if i == menu.get("selected"):
+                pygame.draw.rect(c, ACCENT, rect, 2, border_radius=8)
+            active = i == menu.get("current")
+            draw_text(c, self.font, label + ("   (activa)" if active else ""),
+                      (rect.x + 16, rect.y + (rect.h - self.font.get_height()) // 2),
+                      OK if active else FG)
+            self.menu_rects.append(rect)
+            y += row_h
+
+        draw_text(c, self.font_small,
+                  menu.get("hint", ""),
+                  (BOARD_W // 2, py + ph - 28), DIM, center=True)
 
     def _render_status(self, c, hand_present, stats):
         """Indicador minimo de mano + metricas de rendimiento."""
