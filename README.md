@@ -38,7 +38,7 @@ Instalación
 -
   1.Clonar el repositorio:
   -
-    git clone [https://github.com/tu-usuario/VirtualChalk.git](https://github.com/tu-usuario/VirtualChalk.git)
+    git clone [https://github.com/tu-usuario/VirtualChalk.git](https://github.com/Shiba-Souls/VirtualChalk.git)
     cd VirtualChalk
   2.Instalar dependencias:
   -
