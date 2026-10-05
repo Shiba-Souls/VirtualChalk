@@ -38,7 +38,7 @@ Instalación
 -
   1.Clonar el repositorio:
   -
-    git clone [https://github.com/tu-usuario/VirtualChalk.git](https://github.com/Shiba-Souls/VirtualChalk.git)
+    git clone "(https://github.com/Shiba-Souls/VirtualChalk.git)"
     cd VirtualChalk
   2.Instalar dependencias:
   -
@@ -70,3 +70,4 @@ F: Alternar entre pantalla completa y modo ventana.
 ESC: Salir de la aplicación.
 
 M: Menu que incluye todo lo de arriba e integra el cambio de cámara si es que el dispositivo tiene mas de una.
+[NEW] U: Modo Mouse: Permite controlar el mouse y hacer click con "Pinch"
