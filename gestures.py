@@ -57,6 +57,24 @@ def is_ok_pose(hand, pinch_on=0.30, ext_ratio=1.15):
     return True
 
 
+def is_click_pose(hand, pinch_thr=0.30, curl_ratio=1.05):
+    """
+    Pose de CLICK (Mouse Mode): pulgar e indice unidos + medio, anular y menique
+    CERRADOS (la punta no se aleja de la muneca mas que su PIP, por curl_ratio).
+    Con la mano abierta devuelve False aunque haya pinch.
+    """
+    if hand is None or not hasattr(hand, "landmarks"):
+        return False
+    if hand.pinch >= pinch_thr:
+        return False
+    lm = hand.landmarks
+    wrist = lm[WRIST]
+    for tip, pip in _OTHER_FINGERS:
+        if _dist(lm[tip], wrist) > curl_ratio * _dist(lm[pip], wrist):
+            return False
+    return True
+
+
 class GestureDetector:
     def __init__(self, pinch_on=0.30, pinch_off=0.45, frames=3,
                  ok_frames=3, ok_grace=2, ext_ratio=1.15, enable_erase=True):

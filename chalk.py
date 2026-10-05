@@ -10,6 +10,7 @@ No sabe nada de camara, MediaPipe ni gestos: recibe datos ya calculados
 Quien decide QUE dibujar y CUANDO es main.py.
 """
 
+import platform
 import time
 
 import pygame
@@ -138,7 +139,51 @@ class ChalkRenderer:
         self.screen = pygame.display.set_mode((BOARD_W, BOARD_H), flags, vsync=1)
 
     def toggle_fullscreen(self):
-        self.fullscreen = not self.fullscreen
+        """
+        Cambia entre pantalla completa y ventana.
+
+        En Windows, pasar de fullscreen a ventana puede dejar el render en
+        mal estado (ventana vacia o sin escalar). Se soluciona reinicializando
+        el display con el flag correcto.
+        """
+        old = self.fullscreen
+        self.fullscreen = not old
+        self._set_display()
+
+        # Si el display se creó de nuevo, forzar un repintado inmediato.
+        if pygame.display.get_surface() is not None:
+            pygame.display.update()
+
+    def _hwnd(self):
+        try:
+            return pygame.display.get_wm_info().get("window")
+        except Exception:
+            return None
+
+    def minimize(self):
+        """
+        Minimiza la ventana para que no tape el escritorio (Mouse Mode).
+        En Windows se usa ShowWindow sobre el HWND real: iconify() no minimiza
+        de forma fiable una ventana FULLSCREEN|SCALED y entonces los clics de
+        Mouse Mode caerian sobre la propia ventana de VirtualChalk.
+        """
+        if platform.system() == "Windows":
+            hwnd = self._hwnd()
+            if hwnd:
+                import ctypes
+                ctypes.windll.user32.ShowWindow(hwnd, 6)   # SW_MINIMIZE
+                return
+        pygame.display.iconify()
+
+    def restore(self):
+        """Restaura la ventana y le devuelve el foco."""
+        if platform.system() == "Windows":
+            hwnd = self._hwnd()
+            if hwnd:
+                import ctypes
+                ctypes.windll.user32.ShowWindow(hwnd, 9)   # SW_RESTORE
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+                return
         self._set_display()
 
     def tick(self, fps=60):

@@ -4,16 +4,22 @@ main.py - VirtualChalk: coordinador.
     track.py     camara + MediaPipe + calibracion (donde esta la mano, en el Board)
     gestures.py  que significa cada pose (pinch, OK)
     chalk.py     todo lo que se DIBUJA (pizarra, cursores, HUD, ventana)
+    mouse.py     control del mouse de Windows (cursor, click, drag) via mano
 
-main.py solo conecta las tres piezas.
+main.py solo conecta las cuatro piezas.
+
+Modos (plan v0.2, seccion 21-22):
+    MOUSE   -> controlar Windows (cursor, click, drag, double click)
+    CHALK   -> dibujar sobre la pizarra
+    BOARD   -> trabajar dentro de VirtualChalk (popups, menu) - mismo que CHALK
 
 Ejecucion:
     python main.py            # uso normal (fullscreen en el proyector duplicado)
     python main.py --debug    # ventana normal + vista de camara con landmarks
 
 Teclas (siempre disponibles, son de desarrollo):
-    ESC   salir
-    C     recalibrar
+    ESC   salir (o recuperar Mouse Mode)
+    U     alternar Mouse Mode (seccion 22 del plan)
     M     menu popup (camara, paleta, recalibrar, fullscreen, limpiar)
     P     popup de paleta: rueda de color + brillo + tamano (mouse o pinch)
     + / - tamano del brush y del borrador (tambien dentro de la paleta)
@@ -22,6 +28,7 @@ Teclas (siempre disponibles, son de desarrollo):
 """
 
 import argparse
+import platform
 import sys
 import threading
 import time
@@ -31,7 +38,8 @@ import numpy as np
 import pygame
 
 from chalk import BOARD_W, BOARD_H, ChalkRenderer, calibration_targets
-from gestures import GestureDetector, GestureState
+from gestures import GestureDetector, GestureState, is_click_pose
+from mouse import MouseController, MouseState
 from palette import Palette
 from track import (Tracker, apply_homography, compute_homography, draw_debug,
                    list_cameras, load_config, save_config)
@@ -45,12 +53,39 @@ PINCH_FRAMES = 3                      # frames consecutivos para confirmar
 # --- Borrador (gesto OK) y limpiar pizarra -----------------------------------
 OK_FRAMES = 3                         # frames consecutivos para confirmar el OK
 EXT_RATIO = 1.15                      # dedo extendido: dist(punta, muneca) > 1.15 * dist(PIP, muneca)
+CURL_RATIO = 1.05                     # dedo cerrado: dist(punta, muneca) <= 1.05 * dist(PIP, muneca) (click del Mouse Mode)
 CLEAR_HOLD = 0.7                      # segundos con AMBAS manos en OK para limpiar
 
 BOARD_SIZE = (BOARD_W, BOARD_H)
 
+# --- Modos de VirtualChalk (plan v0.2, seccion 21-22) -------------------------
+MODE_MOUSE = "mouse"        # controlar Windows (cursor, click, drag, ...)
+MODE_CHALK = "chalk"        # dibujar sobre la pizarra
+MODE_BOARD = "board"        # trabajar dentro de VirtualChalk (popups, menu)
+
+# --- Mouse Mode ---------------------------------------------------------------
+# Margen de pantalla: el cursor no llega a los bordes exactos (plan v0.2, s.17).
+MOUSE_MARGIN = 20
+# Calibracion inicial del area de movimiento (plan v0.2, s.17).
+MOUSE_CALIB_MIN = (0.0, 0.0)
+MOUSE_CALIB_MAX = (1.0, 1.0)
+# Sensibilidad inicial del cursor (plan v0.2, s.18).
+MOUSE_SENSITIVITY = 1.2
+# Tiempo sin actualizacion (s) para activar el failsafe (plan v0.2, s.25).
+MOUSE_FAILSAFE_TIMEOUT = 2.0
+# Frames consecutivos para confirmar un gesto (plan v0.2, s.16).
+MOUSE_CONFIRM_FRAMES = 2
+# Umbral de tiempo (s) para considerar dos clicks como doble click (plan v0.2, s.11).
+MOUSE_DOUBLE_CLICK_INTERVAL = 0.45
+# Deadzone minima en px de pantalla (plan v0.2, s.9).
+MOUSE_DEADZONE = 2.0
+# Failsafe temporal: si el tracking no actualiza el cursor en > N s, se libera
+# el botón y se avisa al usuario (plan v0.2, s.25).
+MOUSE_TRACK_TIMEOUT = 2.0
+
 # --- Menu principal (tecla M) --------------------------------------------------
 MENU_ITEMS = [
+    ("mode", "Cambiar modo: MOUSE / CHALK (actual: CHALK)"),
     ("cameras", "Cambiar camara"),
     ("palette", "Paleta de colores  (P)"),
     ("calib", "Recalibrar  (C)"),
@@ -97,6 +132,7 @@ class App:
         self.chalk = ChalkRenderer(fullscreen=fullscreen and not debug)
         self.tracker = Tracker(camera_index=camera)
         self.gestures = make_detector(enable_erase=False)   # solo para calibrar
+        self.mouse = MouseController()
 
         self.H = load_config(BOARD_SIZE)
         self.state = self.STATE_RUN if self.H is not None else self.STATE_CALIB
@@ -109,6 +145,10 @@ class App:
         self._clear_done = False
         self.clear_progress = 0.0     # 0..1, feedback visual de limpiar
         self.running = True
+
+        # Modo actual: mouse, chalk o board (plan v0.2, seccion 21-22)
+        self.mode = MODE_CHALK  # comienza en modo dibujo (compatibilidad)
+        self.mouse_enabled = False  # tracking activo solo en Mouse Mode
 
         # popups: None | "menu" (tecla M) | "camera" (desde el menu) | "palette" (tecla P)
         self.palette = Palette(BOARD_W, BOARD_H)
@@ -221,6 +261,9 @@ class App:
         elif action == "clear":
             self.chalk.clear_board()
             self.close_popup()
+        elif action == "mode":
+            self.close_popup()
+            self._toggle_mouse_mode()
         else:
             self.close_popup()
 
@@ -347,7 +390,12 @@ class App:
                 hands = self.tracker.get_hands()
                 hand = hands[0] if hands else None    # calibracion y HUD
 
-                if self.popup:
+                if self.mode == MODE_MOUSE:
+                    # Mouse Mode: la mano controla el mouse de Windows.
+                    # VirtualChalk puede estar minimizado o en una pequeña
+                    # ventana flotante (plan v0.2, seccion 20).
+                    self._update_mouse(hands)
+                elif self.popup:
                     self._poll_scan()          # con un popup abierto no se dibuja ni calibra
                     self._update_popup(hands)
                 elif self.state == self.STATE_CALIB:
@@ -355,7 +403,8 @@ class App:
                 else:
                     self._update_run(hands)
 
-                self._render(hand)
+                if self.mode != MODE_MOUSE:
+                    self._render(hand)
                 if self.show_cam:
                     self._show_camera(hands)
                 self.chalk.tick(60)
@@ -421,6 +470,83 @@ class App:
             else:
                 ctx.last_pos = None
 
+    # -- Mouse Mode ------------------------------------------------------------
+    # Plan v0.2: seccion 20 (ventana minimizada en segundo plano) y seccion 10
+    # (gestos: pinch = click, pinch + movimiento = drag, release = soltar).
+    @staticmethod
+    def _esc_down():
+        """ESC global (Windows): pygame no recibe teclas con la ventana minimizada."""
+        if platform.system() != "Windows":
+            return False
+        import ctypes
+        return bool(ctypes.windll.user32.GetAsyncKeyState(0x1B) & 0x8000)
+
+    def _update_mouse(self, hands):
+        """
+        Control del mouse de Windows con la mano (seccion 10 del plan).
+        Salida: ESC (global) o la tecla U / menu desde la ventana.
+        """
+        # 0) ESC global: con la ventana minimizada pygame no ve el teclado.
+        if self._esc_down():
+            self._exit_mouse_mode()
+            return
+
+        hand = hands[0] if hands else None
+        if hand is None:
+            # mano perdida: suelta el boton (antes quedaba apretado para siempre)
+            self.mouse.update_pinch(False)
+            return
+
+        # 1) Cursor anclado a los nudillos (MCP indice + medio), NO a la punta
+        #    del indice: al hacer pinch la punta se mueve hacia el pulgar y el
+        #    clic caia lejos de donde apuntabas.
+        a, b = hand.landmarks[5], hand.landmarks[9]
+        self.mouse.move_cursor((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+
+        # 2) Click = pinch con medio/anular/menique CERRADOS. Mano abierta -> no hay clic.
+        #    Histeresis: ya presionado, se tolera un cierre menos estricto y PINCH_OFF.
+        held = self.mouse.is_button_pressed()
+        is_click = is_click_pose(hand,
+                                 PINCH_OFF if held else PINCH_ON,
+                                 EXT_RATIO if held else CURL_RATIO)
+        self.mouse.update_pinch(is_click)
+
+    def _toggle_mouse_mode(self):
+        """Activa o desactiva Mouse Mode (secciones 20, 23, 24, 25 del plan)."""
+        if self.mode == MODE_MOUSE:
+            self._exit_mouse_mode()
+        else:
+            self._enter_mouse_mode()
+
+    def _enter_mouse_mode(self):
+        """Entra en Mouse Mode: minimiza la ventana y empieza a controlar el mouse."""
+        self.mode = MODE_MOUSE
+        self.mouse.reset()
+
+        # Seccion 20: minimizar la ventana (puede quedar en segundo plano).
+        self.chalk.minimize()
+
+        # Seccion 23: recordar el estado anterior para recuperar.
+        self._saved_mode = MODE_CHALK     # chalk y board son lo mismo
+        self._saved_fullscreen = self.chalk.fullscreen
+        self._saved_popup = self.popup
+        self.popup = None                 # cerrar cualquier popup
+        self._toast = ("Mouse Mode: usa la mano para mover el cursor y pinch "
+                       "para hacer click. ESC para recuperar.",
+                       time.perf_counter() + 2.5)
+
+    def _exit_mouse_mode(self):
+        """Sale de Mouse Mode: restaura la ventana y el estado anterior."""
+        self.mouse.reset(release_button=True)
+
+        # Seccion 23: restaurar ventana y estado anterior.
+        self.chalk.restore()
+
+        self.mode = self._saved_mode
+        self.popup = self._saved_popup
+        self._toast = ("Modo restaurado: pulsa M para abrir el menu.",
+                       time.perf_counter() + 2.0)
+
     def _handle_events(self):
         for e in self.chalk.poll_events():
             if e.type == pygame.QUIT:
@@ -450,11 +576,24 @@ class App:
             if k == pygame.K_ESCAPE:
                 self.close_popup()
         elif k == pygame.K_ESCAPE:
-            self.running = False
+            if self.mode == MODE_MOUSE:
+                # ESC recupera el control inmediatamente (seccion 25 del plan).
+                self._exit_mouse_mode()
+            else:
+                self.running = False
         elif k == pygame.K_c:
             self.start_calibration()
         elif k == pygame.K_f:
             self.chalk.toggle_fullscreen()
+        elif k == pygame.K_u:
+            # U = alternar Mouse Mode (seccion 22 del plan).
+            if self.popup is None:
+                self._toggle_mouse_mode()
+        elif k == pygame.K_m:
+            if self.popup is None:
+                self.open_popup("menu")
+            else:
+                self.close_popup()
         elif k == pygame.K_d and self.debug:
             self.show_cam = not self.show_cam
             if not self.show_cam:
@@ -485,7 +624,13 @@ class App:
 
     def _menu_view(self):
         if self.popup == "menu":
-            return {"title": "Menu", "items": [label for _, label in MENU_ITEMS],
+            items = []
+            for i, (action, label) in enumerate(MENU_ITEMS):
+                if action == "mode":
+                    items.append(f"Mouse Mode  (actual: {self.mode.upper()})")
+                else:
+                    items.append(label)
+            return {"title": "Menu", "items": items,
                     "selected": self.sel["menu"], "current": -1, "status": "",
                     "hint": "flechas: elegir  Enter/clic/pinch: aplicar  M/ESC: cerrar"}
         if self.popup == "camera":
