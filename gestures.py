@@ -7,6 +7,13 @@ Gestos:
            extendidos                                      -> ERASE (borrador)
     Dos manos en OK a la vez (lo decide main.py)           -> limpiar la pizarra
 
+Mouse Mode (funciones sin estado):
+    is_click_pose        pulgar + indice, anular/menique cerrados   -> click izquierdo
+    is_triple_pinch      pulgar + indice + medio                    -> doble click
+    is_right_click_pose  pulgar + medio, indice SEPARADO            -> click derecho
+    is_fist_pose         puno cerrado                               -> "levantar el mouse"
+                                                                       (embrague del modo relativo)
+
 GestureDetector tiene estado: usa UNA instancia por mano.
 """
 
@@ -17,6 +24,8 @@ from enum import Enum, auto
 WRIST = 0
 # (punta, PIP) de medio, anular y menique
 _OTHER_FINGERS = ((12, 10), (16, 14), (20, 18))
+# (punta, PIP) de anular y menique: los que deben estar cerrados en el CLICK
+_CLICK_FINGERS = ((16, 14), (20, 18))
 
 
 class GestureState(Enum):
@@ -59,8 +68,9 @@ def is_ok_pose(hand, pinch_on=0.30, ext_ratio=1.15):
 
 def is_click_pose(hand, pinch_thr=0.30, curl_ratio=1.05):
     """
-    Pose de CLICK (Mouse Mode): pulgar e indice unidos + medio, anular y menique
+    Pose de CLICK (Mouse Mode): pulgar e indice unidos + anular y menique
     CERRADOS (la punta no se aleja de la muneca mas que su PIP, por curl_ratio).
+    El medio NO se evalua (queda libre; el doble click lo usa y tiene prioridad).
     Con la mano abierta devuelve False aunque haya pinch.
     """
     if hand is None or not hasattr(hand, "landmarks"):
@@ -69,10 +79,67 @@ def is_click_pose(hand, pinch_thr=0.30, curl_ratio=1.05):
         return False
     lm = hand.landmarks
     wrist = lm[WRIST]
-    for tip, pip in _OTHER_FINGERS:
+    for tip, pip in _CLICK_FINGERS:
         if _dist(lm[tip], wrist) > curl_ratio * _dist(lm[pip], wrist):
             return False
     return True
+
+
+THUMB_TIP, INDEX_TIP, MIDDLE_TIP, MIDDLE_MCP = 4, 8, 12, 9
+
+
+def is_triple_pinch(hand, thr=0.35):
+    """
+    Pinch de tres dedos (DOBLE CLICK en Mouse Mode): las puntas de pulgar, indice
+    y medio unidas a la vez. Ambas distancias (pulgar-indice y pulgar-medio) se
+    normalizan por el tamano de la mano, igual que hand.pinch.
+    """
+    if hand is None or not hasattr(hand, "landmarks"):
+        return False
+    lm = hand.landmarks
+    size = max(_dist(lm[WRIST], lm[MIDDLE_MCP]), 1e-6)
+    d_index = _dist(lm[THUMB_TIP], lm[INDEX_TIP]) / size
+    d_middle = _dist(lm[THUMB_TIP], lm[MIDDLE_TIP]) / size
+    return max(d_index, d_middle) < thr
+
+
+# (punta, PIP) de indice, medio, anular y menique
+_FIST_FINGERS = ((8, 6), (12, 10), (16, 14), (20, 18))
+
+
+def is_fist_pose(hand, curl_ratio=0.95):
+    """
+    Puno cerrado (Mouse Mode relativo = "levantar el mouse"): los cuatro dedos
+    doblados, con la punta mas cerca de la muneca que su PIP (por curl_ratio).
+    curl_ratio < 1 exige un cierre claro: asi el pinch del click (donde el
+    indice sigue medio extendido) no se confunde con un puno.
+    """
+    if hand is None or not hasattr(hand, "landmarks"):
+        return False
+    lm = hand.landmarks
+    wrist = lm[WRIST]
+    for tip, pip in _FIST_FINGERS:
+        if _dist(lm[tip], wrist) > curl_ratio * _dist(lm[pip], wrist):
+            return False
+    return True
+
+
+def is_right_click_pose(hand, thr=0.30, index_min=0.50):
+    """
+    Pose de CLICK DERECHO (Mouse Mode): pulgar y dedo medio unidos, con el
+    indice SEPARADO del pulgar.
+
+    La distancia pulgar-medio se normaliza por el tamano de la mano (igual que
+    hand.pinch). Exigir el indice lejos del pulgar (index_min) evita confundirlo
+    con el click izquierdo (pulgar-indice) y con el doble click (los tres juntos).
+    """
+    if hand is None or not hasattr(hand, "landmarks"):
+        return False
+    lm = hand.landmarks
+    size = max(_dist(lm[WRIST], lm[MIDDLE_MCP]), 1e-6)
+    d_middle = _dist(lm[THUMB_TIP], lm[MIDDLE_TIP]) / size
+    d_index = _dist(lm[THUMB_TIP], lm[INDEX_TIP]) / size
+    return d_middle < thr and d_index > index_min
 
 
 class GestureDetector:

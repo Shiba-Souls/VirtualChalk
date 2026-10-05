@@ -20,7 +20,7 @@ Responsabilidades:
 
     * Movimiento del cursor
     * Click izquierdo
-    * Click derecho   (se reserva un gesto, se implementa despues)
+    * Click derecho   (pinch pulgar + medio, ver update_right_click)
     * Mouse down / up
     * Doble click
     * Scroll          (se implementa despues con gesto especifico)
@@ -107,6 +107,10 @@ DOUBLE_CLICK_INTERVAL = 0.45
 # Sensibilidad inicial: 1.0 = mapeo 1:1 entre la mano y el mouse.
 # Valor bajo = movimientos precisos; valor alto = movimientos rapidos.
 SENSITIVITY_DEFAULT = 1.2
+
+# Modo RELATIVO: cuantos px mueve el cursor por cada px "de pantalla" que se mueve
+# la mano (la camara completa equivale a una pantalla). Mayor = el cursor corre mas.
+RELATIVE_GAIN = 1.5
 
 # Tiempo sin actualizacion (s) para activar el failsafe (tracking fallido).
 FAILSAFE_TIMEOUT = 2.0
@@ -234,6 +238,16 @@ class MouseController:
         # Seccion 18: sensibilidad.
         self.sensitivity = SENSITIVITY_DEFAULT
 
+        # Modo de movimiento:
+        #   absoluto (relative=False): el cursor va donde esta la mano.
+        #   relativo (relative=True):  la mano se comporta como un mouse real, el
+        #     cursor se desplaza por el MOVIMIENTO de la mano. Se "levanta el mouse"
+        #     con clutch() (puno o mano perdida) para reposicionar la mano.
+        self.relative = False
+        self.relative_gain = RELATIVE_GAIN
+        self._rel_anchor = None       # ultima posicion suavizada de la mano (px virtuales)
+        self._rel_pos = None          # posicion del cursor (float, px de pantalla)
+
         # Seccion 14/15: maquina de estados del mouse.
         self.state = MouseState.IDLE
 
@@ -260,6 +274,16 @@ class MouseController:
 
         # Estado de doble click en curso.
         self._double_click_active = False
+
+        # Doble click de tres dedos (pulgar + indice + medio).
+        self._triple_frames = 0
+        self._triple_release = 0
+        self.triple_active = False    # gesto confirmado y aun sostenido
+
+        # Click derecho (pulgar + medio).
+        self._right_frames = 0
+        self._right_release = 0
+        self.right_active = False     # gesto confirmado y aun sostenido
 
     # ---------------------------------------------------------------------
     # Calibracion (seccion 17)
@@ -409,6 +433,9 @@ class MouseController:
         self._last_move_time = now
         self._raw_pos = (norm_x, norm_y)
 
+        if self.relative:
+            return self._move_relative(norm_x, norm_y, now)
+
         pos = self._normalize_to_screen(norm_x, norm_y)
         if pos is None:
             return None
@@ -430,6 +457,68 @@ class MouseController:
                 self.state = MouseState.MOVING
 
         return final
+
+    # ---------------------------------------------------------------------
+    # Modo relativo (la mano se comporta como un mouse real)
+    # ---------------------------------------------------------------------
+    def set_relative(self, relative):
+        """Cambia entre modo absoluto (False) y relativo (True)."""
+        self.relative = bool(relative)
+        self.clutch()
+
+    def clutch(self):
+        """
+        "Levantar el mouse": olvida el punto de referencia de la mano. El cursor
+        se queda quieto y, al volver a mover la mano, el desplazamiento se mide
+        desde su nueva posicion (como reposicionar un mouse real sobre la mesa).
+        """
+        self._rel_anchor = None
+        self._filter_x.reset()
+        self._filter_y.reset()
+
+    def _move_relative(self, norm_x, norm_y, now):
+        """
+        Mueve el cursor por el DESPLAZAMIENTO de la mano, no por su posicion.
+
+        Flujo: posicion de la mano (px virtuales) -> One Euro -> delta respecto
+        al frame anterior -> gain -> suma a la posicion del cursor -> clamp.
+        La calibracion se respeta: el area calibrada equivale a una pantalla.
+        """
+        hx = self._filter_x(norm_x * self.screen_w, now)
+        hy = self._filter_y(norm_y * self.screen_h, now)
+
+        if self._rel_anchor is None:
+            # primer frame (o tras clutch): el cursor arranca donde esta ahora
+            self._rel_anchor = (hx, hy)
+            try:
+                cx, cy = autopy.mouse.location()
+            except Exception:
+                cx, cy = self.screen_w / 2, self.screen_h / 2
+            self._rel_pos = (float(cx), float(cy))
+            self._prev_smoothed = self._rel_pos
+            return self._rel_pos
+
+        dx = hx - self._rel_anchor[0]
+        dy = hy - self._rel_anchor[1]
+        self._rel_anchor = (hx, hy)
+
+        cal_w = self._cal_max[0] - self._cal_min[0]
+        cal_h = self._cal_max[1] - self._cal_min[1]
+        if cal_w > 0 and cal_h > 0:
+            dx, dy = dx / cal_w, dy / cal_h
+        if self.mirror:
+            dx = -dx
+
+        x = min(max(self._rel_pos[0] + dx * self.relative_gain, 0), self.screen_w - 1)
+        y = min(max(self._rel_pos[1] + dy * self.relative_gain, 0), self.screen_h - 1)
+
+        if int(x) != int(self._rel_pos[0]) or int(y) != int(self._rel_pos[1]):
+            autopy.mouse.move(int(x), int(y))
+            if self.state == MouseState.IDLE:
+                self.state = MouseState.MOVING
+        self._rel_pos = (x, y)
+        self._prev_smoothed = self._rel_pos   # lo usan el drag y el click
+        return self._rel_pos
 
     # ---------------------------------------------------------------------
     # Gestion del pinch -> click / drag (secciones 10, 11, 15)
@@ -572,6 +661,63 @@ class MouseController:
         autopy.mouse.click()
         self.state = MouseState.DOUBLE_CLICK
 
+    def update_triple(self, is_triple):
+        """
+        Doble click de tres dedos: dispara UNA vez al confirmar el gesto
+        (CONFIRM_FRAMES frames) y no vuelve a disparar hasta soltarlo
+        (CONFIRM_FRAMES frames sin gesto).
+
+        Devuelve True en el frame en que se ejecuto el doble click.
+        """
+        if is_triple:
+            self._triple_release = 0
+            self._triple_frames += 1
+            if not self.triple_active and self._triple_frames >= CONFIRM_FRAMES:
+                self.triple_active = True
+                # no dejar el boton apretado por un pinch anterior
+                if self._button_pressed:
+                    self.reset(release_button=True)
+                    self.triple_active = True
+                self.double_click()
+                return True
+            return False
+
+        self._triple_frames = 0
+        if self.triple_active:
+            self._triple_release += 1
+            if self._triple_release >= CONFIRM_FRAMES:
+                self.triple_active = False
+                self._triple_release = 0
+        return False
+
+    def update_right_click(self, is_right):
+        """
+        Click derecho (pinch pulgar + medio): dispara UNA vez al confirmar el
+        gesto (CONFIRM_FRAMES frames) y no vuelve a disparar hasta soltarlo
+        (CONFIRM_FRAMES frames sin gesto).
+
+        Devuelve True en el frame en que se ejecuto el click derecho.
+        """
+        if is_right:
+            self._right_release = 0
+            self._right_frames += 1
+            if not self.right_active and self._right_frames >= CONFIRM_FRAMES:
+                # no dejar el boton izquierdo apretado por un pinch anterior
+                if self._button_pressed:
+                    self.reset(release_button=True)
+                self.right_active = True
+                self.right_click()
+                return True
+            return False
+
+        self._right_frames = 0
+        if self.right_active:
+            self._right_release += 1
+            if self._right_release >= CONFIRM_FRAMES:
+                self.right_active = False
+                self._right_release = 0
+        return False
+
     # ---------------------------------------------------------------------
     # Scroll (seccion 13, implementacion base - gestos especificos despues)
     # ---------------------------------------------------------------------
@@ -656,6 +802,13 @@ class MouseController:
         self._click_count = 0
         self._awaiting_second = False
         self._double_click_active = False
+        self._triple_frames = 0
+        self._triple_release = 0
+        self.triple_active = False
+        self._right_frames = 0
+        self._right_release = 0
+        self.right_active = False
+        self._rel_anchor = None
         self._filter_x.reset()
         self._filter_y.reset()
 

@@ -38,7 +38,8 @@ import numpy as np
 import pygame
 
 from chalk import BOARD_W, BOARD_H, ChalkRenderer, calibration_targets
-from gestures import GestureDetector, GestureState, is_click_pose
+from gestures import (GestureDetector, GestureState, is_click_pose,
+                      is_fist_pose, is_right_click_pose, is_triple_pinch)
 from mouse import MouseController, MouseState
 from palette import Palette
 from track import (Tracker, apply_homography, compute_homography, draw_debug,
@@ -54,6 +55,12 @@ PINCH_FRAMES = 3                      # frames consecutivos para confirmar
 OK_FRAMES = 3                         # frames consecutivos para confirmar el OK
 EXT_RATIO = 1.15                      # dedo extendido: dist(punta, muneca) > 1.15 * dist(PIP, muneca)
 CURL_RATIO = 1.05                     # dedo cerrado: dist(punta, muneca) <= 1.05 * dist(PIP, muneca) (click del Mouse Mode)
+TRIPLE_ON = 0.35                      # pulgar-indice y pulgar-medio < 0.35 -> doble click
+TRIPLE_OFF = 0.50                     # hay que superar esto para poder repetirlo
+FIST_RATIO = 0.95                     # puno: punta < 0.95 * PIP en los 4 dedos -> "levantar el mouse" (modo relativo)
+RIGHT_ON = 0.30                       # pulgar-medio < 0.30 -> click derecho
+RIGHT_OFF = 0.45                      # hay que superar esto para poder repetirlo
+RIGHT_INDEX_MIN = 0.50                # el indice debe estar mas lejos que esto del pulgar
 CLEAR_HOLD = 0.7                      # segundos con AMBAS manos en OK para limpiar
 
 BOARD_SIZE = (BOARD_W, BOARD_H)
@@ -85,7 +92,8 @@ MOUSE_TRACK_TIMEOUT = 2.0
 
 # --- Menu principal (tecla M) --------------------------------------------------
 MENU_ITEMS = [
-    ("mode", "Cambiar modo: MOUSE / CHALK (actual: CHALK)"),
+    ("mouse_abs", "Mouse absoluto: el cursor sigue a la mano"),
+    ("mouse_rel", "Mouse relativo: como un mouse real"),
     ("cameras", "Cambiar camara"),
     ("palette", "Paleta de colores  (P)"),
     ("calib", "Recalibrar  (C)"),
@@ -151,7 +159,7 @@ class App:
         self.mouse_enabled = False  # tracking activo solo en Mouse Mode
 
         # popups: None | "menu" (tecla M) | "camera" (desde el menu) | "palette" (tecla P)
-        self.palette = Palette(BOARD_W, BOARD_H)
+        self.palette = Palette(BOARD_W, BOARD_H, rel_gain=self.mouse.relative_gain)
         self.popup = None
         self.sel = {"menu": 0, "camera": 0}
         self.menu_cams = []           # [{"index", "label"}]
@@ -261,9 +269,9 @@ class App:
         elif action == "clear":
             self.chalk.clear_board()
             self.close_popup()
-        elif action == "mode":
+        elif action in ("mouse_abs", "mouse_rel"):
             self.close_popup()
-            self._toggle_mouse_mode()
+            self._enter_mouse_mode(relative=(action == "mouse_rel"))
         else:
             self.close_popup()
 
@@ -340,7 +348,9 @@ class App:
     def _pointer(self, kind, pos):
         """Puntero unificado (mouse o mano): kind = "down" | "move" | "up"."""
         if self.popup == "palette":
-            if self.palette.pointer(kind, pos):
+            closed = self.palette.pointer(kind, pos)
+            self.mouse.relative_gain = self.palette.rel_gain   # sensibilidad del mouse relativo
+            if closed:
                 self.close_popup()
             return
         hit = self.chalk.menu_hit(pos)
@@ -495,6 +505,16 @@ class App:
         if hand is None:
             # mano perdida: suelta el boton (antes quedaba apretado para siempre)
             self.mouse.update_pinch(False)
+            if self.mouse.relative:
+                self.mouse.clutch()       # mano fuera de camara = mouse levantado
+            return
+
+        # 0b) Modo relativo: puno = "levantar el mouse" (el cursor no se mueve y la
+        #     referencia se reinicia para reposicionar la mano). Tiene prioridad sobre
+        #     el click, que exige el indice menos cerrado que esto.
+        if self.mouse.relative and is_fist_pose(hand, FIST_RATIO):
+            self.mouse.clutch()
+            self.mouse.update_pinch(False)
             return
 
         # 1) Cursor anclado a los nudillos (MCP indice + medio), NO a la punta
@@ -505,6 +525,26 @@ class App:
 
         # 2) Click = pinch con medio/anular/menique CERRADOS. Mano abierta -> no hay clic.
         #    Histeresis: ya presionado, se tolera un cierre menos estricto y PINCH_OFF.
+        # Doble click: pulgar + indice + medio unidos. Tiene prioridad sobre el click
+        # simple (mientras dure, el click normal queda suprimido).
+        triple = is_triple_pinch(hand, TRIPLE_OFF if self.mouse.triple_active else TRIPLE_ON)
+        if self.mouse.update_triple(triple):
+            self._toast = ("Doble click", time.perf_counter() + 0.6)
+        if triple or self.mouse.triple_active:
+            self.mouse.update_pinch(False)
+            return
+
+        # Click derecho: pulgar + medio unidos, indice separado. Mientras dure,
+        # el click izquierdo queda suprimido.
+        right = is_right_click_pose(hand,
+                                    RIGHT_OFF if self.mouse.right_active else RIGHT_ON,
+                                    RIGHT_INDEX_MIN)
+        if self.mouse.update_right_click(right):
+            self._toast = ("Click derecho", time.perf_counter() + 0.6)
+        if right or self.mouse.right_active:
+            self.mouse.update_pinch(False)
+            return
+
         held = self.mouse.is_button_pressed()
         is_click = is_click_pose(hand,
                                  PINCH_OFF if held else PINCH_ON,
@@ -518,8 +558,15 @@ class App:
         else:
             self._enter_mouse_mode()
 
-    def _enter_mouse_mode(self):
-        """Entra en Mouse Mode: minimiza la ventana y empieza a controlar el mouse."""
+    def _enter_mouse_mode(self, relative=None):
+        """
+        Entra en Mouse Mode: minimiza la ventana y empieza a controlar el mouse.
+
+        relative: True = modo relativo, False = absoluto, None = el ultimo usado
+        (es el caso de la tecla U; el menu elige explicitamente).
+        """
+        if relative is not None:
+            self.mouse.set_relative(relative)
         self.mode = MODE_MOUSE
         self.mouse.reset()
 
@@ -531,9 +578,13 @@ class App:
         self._saved_fullscreen = self.chalk.fullscreen
         self._saved_popup = self.popup
         self.popup = None                 # cerrar cualquier popup
-        self._toast = ("Mouse Mode: usa la mano para mover el cursor y pinch "
-                       "para hacer click. ESC para recuperar.",
-                       time.perf_counter() + 2.5)
+        if self.mouse.relative:
+            msg = ("Mouse Mode relativo: mueve la mano como un mouse, puno = levantar "
+                   "el mouse, pinch = click. ESC para recuperar.")
+        else:
+            msg = ("Mouse Mode absoluto: el cursor sigue a la mano, pinch = click. "
+                   "ESC para recuperar.")
+        self._toast = (msg, time.perf_counter() + 2.5)
 
     def _exit_mouse_mode(self):
         """Sale de Mouse Mode: restaura la ventana y el estado anterior."""
@@ -624,14 +675,11 @@ class App:
 
     def _menu_view(self):
         if self.popup == "menu":
-            items = []
-            for i, (action, label) in enumerate(MENU_ITEMS):
-                if action == "mode":
-                    items.append(f"Mouse Mode  (actual: {self.mode.upper()})")
-                else:
-                    items.append(label)
+            items = [label for _, label in MENU_ITEMS]
+            last = "mouse_rel" if self.mouse.relative else "mouse_abs"
+            current = next(i for i, (a, _) in enumerate(MENU_ITEMS) if a == last)
             return {"title": "Menu", "items": items,
-                    "selected": self.sel["menu"], "current": -1, "status": "",
+                    "selected": self.sel["menu"], "current": current, "status": "",
                     "hint": "flechas: elegir  Enter/clic/pinch: aplicar  M/ESC: cerrar"}
         if self.popup == "camera":
             return {"title": "Cambiar camara",

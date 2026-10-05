@@ -10,6 +10,8 @@ Estado que usa el resto del programa:
     palette.size             ancho del brush en px
     palette.erase_radius     radio del borrador en px (escala con `size`)
     palette.change_size(d)   para las teclas + y -
+    palette.rel_gain         sensibilidad del Mouse Mode relativo (main.py la copia
+                             a MouseController.relative_gain)
 """
 
 import colorsys
@@ -29,6 +31,8 @@ WARN = (255, 170, 60)
 SIZE_MIN, SIZE_MAX = 2, 24
 DEFAULT_SIZE = 5                  # ancho de trazo original
 ERASE_PER_SIZE = 5.6              # 5 px de brush -> 28 px de borrador (valores originales)
+GAIN_MIN, GAIN_MAX = 0.5, 4.0     # sensibilidad del mouse relativo (px de cursor por px de mano)
+DEFAULT_GAIN = 1.5
 VAL_MIN = 0.25                    # brillo minimo: por debajo no se ve sobre el fondo oscuro
 
 PRESETS = [
@@ -82,9 +86,10 @@ def _text(surf, font, text, pos, color=FG, center=False):
 
 
 class Palette:
-    W, H, R = 840, 470, 150
+    W, H, R = 840, 520, 150
 
-    def __init__(self, screen_w, screen_h, color=FG, size=DEFAULT_SIZE):
+    def __init__(self, screen_w, screen_h, color=FG, size=DEFAULT_SIZE,
+                 rel_gain=DEFAULT_GAIN):
         self.px = (screen_w - self.W) // 2
         self.py = (screen_h - self.H) // 2
         self.wheel_c = (self.px + 50 + self.R, self.py + 90 + self.R)
@@ -93,9 +98,11 @@ class Palette:
         self.preview_rect = pygame.Rect(rx, self.py + 90, rw, 90)
         self.val_rect = pygame.Rect(rx, self.py + 235, rw, 14)
         self.size_rect = pygame.Rect(rx, self.py + 305, rw, 14)
-        self.preset_rects = [pygame.Rect(rx + i * 48, self.py + 350, 40, 40)
+        self.gain_rect = pygame.Rect(rx, self.py + 375, rw, 14)
+        self.preset_rects = [pygame.Rect(rx + i * 48, self.py + 420, 40, 40)
                              for i in range(len(PRESETS))]
         self.size = size
+        self.rel_gain = min(max(rel_gain, GAIN_MIN), GAIN_MAX)
         self._drag = None
         self._wheel = (None, None)        # (clave de brillo, superficie)
         self.set_color(color)
@@ -125,6 +132,8 @@ class Palette:
             return "val"
         if self.size_rect.inflate(0, 28).collidepoint(pos):
             return "size"
+        if self.gain_rect.inflate(0, 28).collidepoint(pos):
+            return "gain"
         for i, r in enumerate(self.preset_rects):
             if r.collidepoint(pos):
                 return i
@@ -142,6 +151,9 @@ class Palette:
         elif self._drag == "size":
             t = min(max((pos[0] - self.size_rect.x) / self.size_rect.w, 0), 1)
             self.size = int(round(SIZE_MIN + t * (SIZE_MAX - SIZE_MIN)))
+        elif self._drag == "gain":
+            t = min(max((pos[0] - self.gain_rect.x) / self.gain_rect.w, 0), 1)
+            self.rel_gain = round(GAIN_MIN + t * (GAIN_MAX - GAIN_MIN), 1)
 
     def pointer(self, kind, pos):
         """kind: "down" | "move" | "up". Devuelve True si se pidio cerrar el popup."""
@@ -223,6 +235,16 @@ class Palette:
         pygame.draw.rect(surf, FRAME, sr, border_radius=7)
         pygame.draw.rect(surf, ACCENT, (sr.x, sr.y, int(t * sr.w), sr.h), border_radius=7)
         self._knob(surf, int(sr.x + t * sr.w), sr.centery)
+
+        # sensibilidad del mouse relativo
+        gr = self.gain_rect
+        _text(surf, font_small,
+              f"Sensibilidad mouse relativo: x{self.rel_gain:.1f}",
+              (gr.x, gr.y - 30), DIM)
+        t = (self.rel_gain - GAIN_MIN) / (GAIN_MAX - GAIN_MIN)
+        pygame.draw.rect(surf, FRAME, gr, border_radius=7)
+        pygame.draw.rect(surf, ACCENT, (gr.x, gr.y, int(t * gr.w), gr.h), border_radius=7)
+        self._knob(surf, int(gr.x + t * gr.w), gr.centery)
 
         # colores rapidos
         for rect, col in zip(self.preset_rects, PRESETS):
