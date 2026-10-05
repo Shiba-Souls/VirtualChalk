@@ -70,4 +70,4 @@ F: Alternar entre pantalla completa y modo ventana.
 ESC: Salir de la aplicación.
 
 M: Menu que incluye todo lo de arriba e integra el cambio de cámara si es que el dispositivo tiene mas de una.
-[NEW] U: Modo Mouse: Permite controlar el mouse y hacer click con "Pinch"
+[NEW] U: Modo Mouse: Permite controlar el mouse y hacer clic con "Pinch" (indice y pulgar), dobleclick con "Pinch" del dedo Medio y pulgar. Click derecho con indice+medio+pulgar.
